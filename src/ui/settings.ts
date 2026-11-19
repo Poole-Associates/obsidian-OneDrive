@@ -20,9 +20,16 @@ import {
 	OneDriveItem,
 	ExperimentalSettings,
 	DEFAULT_EXPERIMENTAL_SETTINGS,
+	SharePointFolderTarget,
+	SharePointLibrary,
 } from '../types';
 import { DEFAULT_ONEDRIVE_CLIENT_ID } from '../constants';
-import { FolderBrowserModal, FolderSelection } from './folderBrowserModal';
+import {
+	describeWebUrl,
+	FolderBrowserModal,
+	FolderSelection,
+	SharePointPickerApi,
+} from './folderBrowserModal';
 import type { SyncStatusInfo } from '../main';
 import { SyncStatus } from './statusBar';
 import { t } from '../i18n';
@@ -68,6 +75,10 @@ interface OneDrivePlugin extends Plugin {
 		relativePathInShared?: string
 	): Promise<OneDriveItem[]>;
 	listAppFoldersForPicker(path: string): Promise<OneDriveItem[]>;
+	supportsSharePoint(): boolean;
+	searchDocumentLibraries(query: string): Promise<SharePointLibrary[]>;
+	resolveSharePointLink(url: string): Promise<SharePointFolderTarget>;
+	getLibraryRoot(driveId: string): Promise<{ id: string; name: string }>;
 	onRemoteFolderChanged(selection: FolderSelection): Promise<void>;
 	onAppFolderSubpathChanged(subpath: string): Promise<void>;
 	getSyncStatusInfo(): SyncStatusInfo;
@@ -748,6 +759,30 @@ export class OneDriveSettingTab extends PluginSettingTab {
 		);
 	}
 
+	/** Settings text for the chosen remote folder: plain, shared, or SharePoint. */
+	private describeRemoteFolder(): string {
+		const settings = this.plugin.settings;
+		const currentPath = settings.remotePath || t('settings.syncFolder.notSelected');
+		if (!settings.remoteDriveId) return currentPath;
+		if (settings.remoteWebUrl || settings.remoteItemIsDriveRoot) {
+			const location = describeWebUrl(settings.remoteWebUrl);
+			return location
+				? t('settings.syncFolder.sharePointFolderAt', { path: currentPath, location })
+				: t('settings.syncFolder.sharePointFolder', { path: currentPath });
+		}
+		return t('settings.syncFolder.sharedFolder', { path: currentPath });
+	}
+
+	/** SharePoint discovery for the folder picker; work and school accounts only. */
+	private sharePointPickerApi(): SharePointPickerApi | undefined {
+		if (!this.plugin.supportsSharePoint()) return undefined;
+		return {
+			searchLibraries: (query) => this.plugin.searchDocumentLibraries(query),
+			resolveLink: (url) => this.plugin.resolveSharePointLink(url),
+			getLibraryRoot: (driveId) => this.plugin.getLibraryRoot(driveId),
+		};
+	}
+
 	private renderRemoteFolderSetting(setting: Setting): void {
 		const isConnected = !!this.plugin.settings.connectedUser;
 		if (!isConnected) {
@@ -757,11 +792,7 @@ export class OneDriveSettingTab extends PluginSettingTab {
 			return;
 		}
 
-		const currentPath = this.plugin.settings.remotePath || t('settings.syncFolder.notSelected');
-		const isShared = !!this.plugin.settings.remoteDriveId;
-		const desc = isShared
-			? t('settings.syncFolder.sharedFolder', { path: currentPath })
-			: currentPath;
+		const desc = this.describeRemoteFolder();
 
 		setting
 			.setName(t('settings.syncFolder.remoteFolder'))
@@ -778,7 +809,7 @@ export class OneDriveSettingTab extends PluginSettingTab {
 							});
 						},
 						undefined,
-						{ warnOnRootSelect: true }
+						{ warnOnRootSelect: true, sharePoint: this.sharePointPickerApi() }
 					);
 					modal.open();
 				})
@@ -1078,11 +1109,7 @@ export class OneDriveSettingTab extends PluginSettingTab {
 			new Setting(containerEl).setName(t('settings.syncFolder.heading')).setHeading();
 
 			if (isConnected) {
-				const currentPath = this.plugin.settings.remotePath || t('settings.syncFolder.notSelected');
-				const isShared = !!this.plugin.settings.remoteDriveId;
-				const desc = isShared
-					? t('settings.syncFolder.sharedFolder', { path: currentPath })
-					: currentPath;
+				const desc = this.describeRemoteFolder();
 
 				new Setting(containerEl)
 					.setName(t('settings.syncFolder.remoteFolder'))
@@ -1099,7 +1126,7 @@ export class OneDriveSettingTab extends PluginSettingTab {
 									});
 								},
 								undefined,
-								{ warnOnRootSelect: true }
+								{ warnOnRootSelect: true, sharePoint: this.sharePointPickerApi() }
 							);
 							modal.open();
 						})

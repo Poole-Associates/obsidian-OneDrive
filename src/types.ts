@@ -72,6 +72,30 @@ export interface OneDriveItem {
 	__resolvedVaultPath?: string;
 }
 
+/**
+ * A SharePoint document library, as found by library search. To Graph a
+ * library is just a drive, so `driveId` is all the sync needs.
+ */
+export interface SharePointLibrary {
+	driveId: string;
+	name: string;
+	/** Browser URL of the library, shown so same-named libraries can be told apart */
+	webUrl?: string;
+}
+
+/**
+ * A SharePoint folder (or a whole library) resolved from a pasted link.
+ */
+export interface SharePointFolderTarget {
+	driveId: string;
+	/** Item id of the folder; the library's root item when isDriveRoot */
+	itemId: string;
+	name: string;
+	/** True when the link pointed at the library itself rather than a folder in it */
+	isDriveRoot: boolean;
+	webUrl?: string;
+}
+
 export interface OneDriveUploadSession {
 	uploadUrl: string;
 	expirationDateTime: string;
@@ -359,6 +383,8 @@ export interface PluginSettings {
 	remoteRootName?: string; // Display name of the root folder on the remote drive
 	remoteRootPath?: string; // Full path of the folder on the remote drive (e.g. /Documents/ObsidianVaults/JeffBrain)
 	remoteRelativePathInShared?: string; // Path from the shared root to the selected vault folder
+	remoteItemIsDriveRoot?: boolean; // remoteItemId is a whole SharePoint document library (its drive root)
+	remoteWebUrl?: string; // Browser URL of the SharePoint library or folder, shown in settings
 	logLevel: 'off' | 'error' | 'warn' | 'info' | 'debug';
 	notificationLevel: NotificationLevel; // On-screen notice verbosity: all, errors only, or off
 	largeDeleteThreshold: number; // Warn if a sync would delete more than this many files (0 = disabled)

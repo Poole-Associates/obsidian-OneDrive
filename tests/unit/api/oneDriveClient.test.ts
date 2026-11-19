@@ -32,7 +32,7 @@ vi.mock('../../../src/utils/logger', () => ({
 }));
 
 import { OneDriveAccessMode, OneDriveError } from '../../../src/types';
-import { OneDriveClient } from '../../../src/api/oneDriveClient';
+import { OneDriveClient, encodeSharingUrl } from '../../../src/api/oneDriveClient';
 import { encodePathForGraph } from '../../../src/utils/pathUtils';
 import { SYNC_CONFIG } from '../../../src/constants';
 
@@ -709,6 +709,193 @@ describe('OneDriveClient', () => {
 
 			await client.getDelta();
 			expect(mockClient.api).toHaveBeenCalledWith('/drives/drive-123/items/item-456/delta');
+		});
+	});
+
+	describe('SharePoint libraries', () => {
+		describe('encodeSharingUrl', () => {
+			// Expected values computed independently (Python base64) per
+			// https://learn.microsoft.com/graph/api/shares-get#encoding-sharing-urls
+			it('encodes a plain library URL as u! + unpadded base64url', () => {
+				expect(encodeSharingUrl('https://contoso.sharepoint.com/sites/Team/Shared Documents/Vault')).toBe(
+					'u!aHR0cHM6Ly9jb250b3NvLnNoYXJlcG9pbnQuY29tL3NpdGVzL1RlYW0vU2hhcmVkIERvY3VtZW50cy9WYXVsdA'
+				);
+			});
+
+			it('maps / to _ and + to - and strips padding', () => {
+				expect(encodeSharingUrl('https://contoso.sharepoint.com/:f:/s/Team/Ea?e=~~~>>>')).toBe(
+					'u!aHR0cHM6Ly9jb250b3NvLnNoYXJlcG9pbnQuY29tLzpmOi9zL1RlYW0vRWE_ZT1-fn4-Pj4'
+				);
+			});
+
+			it('encodes non-ASCII characters as UTF-8', () => {
+				expect(encodeSharingUrl('https://contoso.sharepoint.com/:f:/s/Team/EaBc?e=x1Y~ü')).toBe(
+					'u!aHR0cHM6Ly9jb250b3NvLnNoYXJlcG9pbnQuY29tLzpmOi9zL1RlYW0vRWFCYz9lPXgxWX7DvA'
+				);
+			});
+		});
+
+		describe('searchDocumentLibraries', () => {
+			it('searches drives through the Microsoft Search API and maps hits', async () => {
+				mockApiPost.mockResolvedValue({
+					value: [
+						{
+							hitsContainers: [
+								{
+									hits: [
+										{ resource: { id: 'd1', name: 'Team Notes', webUrl: 'https://c.sharepoint.com/sites/T/Team%20Notes', driveType: 'documentLibrary' } },
+										{ resource: { id: 'd2', name: 'Documents' } },
+									],
+								},
+							],
+						},
+					],
+				});
+
+				await expect(client.searchDocumentLibraries('  team ')).resolves.toEqual([
+					{ driveId: 'd1', name: 'Team Notes', webUrl: 'https://c.sharepoint.com/sites/T/Team%20Notes' },
+					{ driveId: 'd2', name: 'Documents', webUrl: undefined },
+				]);
+				expect(mockClient.api).toHaveBeenCalledWith('/search/query');
+				expect(mockApiPost).toHaveBeenCalledWith({
+					requests: [{ entityTypes: ['drive'], query: { queryString: 'team' }, from: 0, size: 25 }],
+				});
+			});
+
+			it('drops duplicates and drives that are not document libraries', async () => {
+				mockApiPost.mockResolvedValue({
+					value: [
+						{
+							hitsContainers: [
+								{
+									hits: [
+										{ resource: { id: 'd1', name: 'Team Notes' } },
+										{ resource: { id: 'd1', name: 'Team Notes' } },
+										{ resource: { id: 'p1', name: 'OneDrive', driveType: 'business' } },
+										{ resource: {} },
+									],
+								},
+							],
+						},
+					],
+				});
+
+				const result = await client.searchDocumentLibraries('team');
+				expect(result.map((library) => library.driveId)).toEqual(['d1']);
+			});
+
+			it('returns nothing without calling Graph for a blank query', async () => {
+				await expect(client.searchDocumentLibraries('   ')).resolves.toEqual([]);
+				expect(mockApiPost).not.toHaveBeenCalled();
+			});
+
+			it('handles an empty search response', async () => {
+				mockApiPost.mockResolvedValue({ value: [{ hitsContainers: [{ total: 0 }] }] });
+				await expect(client.searchDocumentLibraries('nothing')).resolves.toEqual([]);
+			});
+
+			it('wraps search failures in OneDriveError', async () => {
+				mockApiPost.mockRejectedValue(new Error('Forbidden'));
+				await expect(client.searchDocumentLibraries('team')).rejects.toThrow(
+					'Failed to search SharePoint libraries: Forbidden'
+				);
+			});
+		});
+
+		describe('resolveSharePointLink', () => {
+			const link = 'https://contoso.sharepoint.com/sites/Team/Shared Documents/Vault';
+
+			it('resolves a folder link to its drive and item', async () => {
+				mockApiGet.mockResolvedValue({
+					id: 'folder-id',
+					name: 'Vault',
+					folder: { childCount: 3 },
+					parentReference: { driveId: 'drive-1', id: 'parent', path: '/drives/drive-1/root:' },
+					webUrl: link,
+				});
+
+				await expect(client.resolveSharePointLink(`  ${link}  `)).resolves.toEqual({
+					driveId: 'drive-1',
+					itemId: 'folder-id',
+					name: 'Vault',
+					isDriveRoot: false,
+					webUrl: link,
+				});
+				expect(mockClient.api).toHaveBeenCalledWith(`/shares/${encodeSharingUrl(link)}/driveItem`);
+			});
+
+			it('marks a library link as a drive root and uses the library name', async () => {
+				mockApiGet
+					.mockResolvedValueOnce({
+						id: 'root-id',
+						name: 'root',
+						root: {},
+						folder: { childCount: 1 },
+						parentReference: { driveId: 'drive-1' },
+					})
+					.mockResolvedValueOnce({ name: 'Team Notes' });
+
+				const result = await client.resolveSharePointLink(link);
+				expect(result).toMatchObject({ itemId: 'root-id', name: 'Team Notes', isDriveRoot: true });
+				expect(mockClient.api).toHaveBeenNthCalledWith(2, '/drives/drive-1?$select=name');
+			});
+
+			it('keeps the root item name if the library name cannot be read', async () => {
+				mockApiGet
+					.mockResolvedValueOnce({ id: 'root-id', name: 'root', root: {}, parentReference: { driveId: 'drive-1' } })
+					.mockRejectedValueOnce(new Error('nope'));
+
+				await expect(client.resolveSharePointLink(link)).resolves.toMatchObject({ name: 'root', isDriveRoot: true });
+			});
+
+			it('rejects a link to a file', async () => {
+				mockApiGet.mockResolvedValue({
+					id: 'file-id',
+					name: 'note.md',
+					file: { mimeType: 'text/markdown' },
+					parentReference: { driveId: 'drive-1' },
+				});
+
+				await expect(client.resolveSharePointLink(link)).rejects.toThrow('That link points to a file');
+			});
+
+			it('reports a link Graph cannot open', async () => {
+				mockApiGet.mockRejectedValue(new Error('Access denied'));
+				await expect(client.resolveSharePointLink(link)).rejects.toThrow('Could not open that link: Access denied');
+			});
+		});
+
+		it('getDriveRoot returns the root item of a library', async () => {
+			mockApiGet.mockResolvedValue({ id: 'root-id', name: 'root' });
+			await expect(client.getDriveRoot('drive-1')).resolves.toEqual({ id: 'root-id', name: 'root' });
+			expect(mockClient.api).toHaveBeenCalledWith('/drives/drive-1/root');
+		});
+
+		// A whole library uses the delta form Graph documents
+		// (GET /drives/{drive-id}/root/delta), not the item-based one.
+		it('uses the documented drive-root delta for a whole library', async () => {
+			client.setRemoteDrive('drive-1', 'root-id', 'Team Notes', '', true);
+			mockApiGet.mockResolvedValue({ value: [], '@odata.deltaLink': 'delta-1' });
+
+			await client.getDelta();
+			expect(mockClient.api).toHaveBeenCalledWith('/drives/drive-1/root/delta');
+		});
+
+		it('scopes the drive-root delta to a vault folder inside the library', async () => {
+			client.setRemoteDrive('drive-1', 'root-id', 'Team Notes', 'Vault', true);
+			mockApiGet.mockResolvedValue({ value: [], '@odata.deltaLink': 'delta-1' });
+
+			await client.getDelta(undefined, '', '.obsidian');
+			expect(mockClient.api).toHaveBeenCalledWith(
+				`/drives/drive-1/root:/${encodePathForGraph('Vault/.obsidian')}:/delta`
+			);
+		});
+
+		it('keeps file operations on the library root item', () => {
+			client.setRemoteDrive('drive-1', 'root-id', 'Team Notes', 'Vault', true);
+			expect(client.buildEndpoint('note.md', 'content')).toBe(
+				`/drives/drive-1/items/root-id:/${encodePathForGraph('Vault/note.md')}:/content`
+			);
 		});
 	});
 

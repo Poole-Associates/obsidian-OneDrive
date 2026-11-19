@@ -20,6 +20,7 @@ Sync your Obsidian vault with **OneDrive**. Zero-config for personal Microsoft a
 
 - **Zero-Configuration for Personal Accounts** — No Azure AD app registration needed. Just click connect and authenticate.
 - **Work and School Accounts** — Entra ID (Microsoft 365 Business/Enterprise) accounts are supported with your own app registration. See [Advanced Usage](docs/ADVANCED.md#account-types).
+- **SharePoint Libraries** — Work and school accounts can also sync a vault with a folder in a SharePoint document library. See [Advanced Usage](docs/ADVANCED.md#sharepoint-document-libraries).
 - **Mobile-First** — Device Code Flow works on iOS and Android with no redirects.
 - **Event-Driven Sync** — Syncs on file changes, not polling. Great for battery life.
 - **Bidirectional** — Automatic two-way sync with configurable conflict resolution.
