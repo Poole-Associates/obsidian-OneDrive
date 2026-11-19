@@ -35,7 +35,15 @@
 import { Client } from '@microsoft/microsoft-graph-client';
 import { requestUrl } from 'obsidian';
 import { OneDriveAuthProvider } from '../auth/authProvider';
-import { OneDriveItem, OneDriveUser, OneDriveError, OneDriveAccessMode, DeltaResponse } from '../types';
+import {
+	OneDriveItem,
+	OneDriveUser,
+	OneDriveError,
+	OneDriveAccessMode,
+	DeltaResponse,
+	SharePointFolderTarget,
+	SharePointLibrary,
+} from '../types';
 import { logger } from '../utils/logger';
 import { retryWithBackoff } from '../utils/retry';
 import { encodePathForGraph, stripGraphPrefix } from '../utils/pathUtils';
@@ -51,6 +59,33 @@ interface GraphDeltaApiResponse<T> extends GraphCollectionResponse<T> {
 }
 
 type GraphUserResponse = Pick<OneDriveUser, 'id' | 'displayName' | 'mail' | 'userPrincipalName'>;
+
+/** Shape of a Microsoft Search API (`POST /search/query`) response for `drive` hits. */
+interface GraphSearchResponse {
+	value?: Array<{
+		hitsContainers?: Array<{
+			hits?: Array<{
+				resource?: { id?: string; name?: string; webUrl?: string; driveType?: string };
+			}>;
+		}>;
+	}>;
+}
+
+/** How many document libraries a single library search returns. */
+const SHAREPOINT_SEARCH_PAGE_SIZE = 25;
+
+/**
+ * Turn a sharing or item URL into the token GET /shares/{token} expects:
+ * base64 of the UTF-8 URL, converted to unpadded base64url, prefixed "u!".
+ * https://learn.microsoft.com/graph/api/shares-get#encoding-sharing-urls
+ */
+export function encodeSharingUrl(url: string): string {
+	const bytes = new TextEncoder().encode(url);
+	let binary = '';
+	for (const byte of bytes) binary += String.fromCharCode(byte);
+	const base64url = btoa(binary).replace(/=+$/, '').replace(/\//g, '_').replace(/\+/g, '-');
+	return `u!${base64url}`;
+}
 
 /**
  * OneDrive client for interacting with Microsoft Graph API
@@ -69,6 +104,9 @@ export class OneDriveClient {
 	// Example: "ObsidianVaults/JeffBrain" when shared root is "Jeff Documents"
 	// and vault is at "Jeff Documents/ObsidianVaults/JeffBrain".
 	private relativePathInShared = '';
+	// True when remoteItemId is the root of its drive — a whole SharePoint
+	// document library. Delta then uses the documented drive-root form.
+	private remoteItemIsDriveRoot = false;
 	// Item id of the App Folder, resolved on first use (see folderChildrenEndpoint)
 	private appRootId?: string;
 
@@ -89,13 +127,22 @@ export class OneDriveClient {
 	 * @param rootName - Display name of the shared root folder
 	 * @param relativePath - Path from the shared root to the vault folder
 	 *                       (empty string when the vault IS the shared root)
+	 * @param isDriveRoot - True when itemId is the root of the drive (a whole
+	 *                      SharePoint document library, not a folder in one)
 	 */
-	setRemoteDrive(driveId: string, itemId: string, rootName: string, relativePath = ''): void {
+	setRemoteDrive(
+		driveId: string,
+		itemId: string,
+		rootName: string,
+		relativePath = '',
+		isDriveRoot = false
+	): void {
 		this.remoteDriveId = driveId;
 		this.remoteItemId = itemId;
 		this.remoteRootName = rootName;
 		this.relativePathInShared = relativePath.replace(/^\/+|\/+$/g, '');
-		logger.info(`Configured shared drive: driveId=${driveId}, itemId=${itemId}, rootName=${rootName}, relativePath=${this.relativePathInShared || '(root)'}`);
+		this.remoteItemIsDriveRoot = isDriveRoot;
+		logger.info(`Configured shared drive: driveId=${driveId}, itemId=${itemId}, rootName=${rootName}, relativePath=${this.relativePathInShared || '(root)'}, driveRoot=${isDriveRoot}`);
 	}
 
 	/**
@@ -225,6 +272,129 @@ export class OneDriveClient {
 			logger.error('Failed to resolve shared folder path:', error);
 			throw new OneDriveError(
 				`Failed to resolve shared folder: ${error instanceof Error ? error.message : 'Unknown error'}`
+			);
+		}
+	}
+
+	/**
+	 * Find SharePoint document libraries whose name matches a search term.
+	 *
+	 * Uses the Microsoft Search API with entityType `drive`, which Graph allows
+	 * under Files.Read.All / Files.ReadWrite.All — the permission work and
+	 * school accounts already sign in with — so no new consent is needed.
+	 * Graph requires the query to contain a term from the library's name;
+	 * `*` does not list every library.
+	 * https://learn.microsoft.com/graph/search-concept-files
+	 */
+	async searchDocumentLibraries(query: string): Promise<SharePointLibrary[]> {
+		const queryString = query.trim();
+		if (!queryString) return [];
+		logger.debug('Searching SharePoint document libraries:', { queryString });
+
+		try {
+			const response = await this.postGraph<GraphSearchResponse>('/search/query', {
+				requests: [
+					{
+						entityTypes: ['drive'],
+						query: { queryString },
+						from: 0,
+						size: SHAREPOINT_SEARCH_PAGE_SIZE,
+					},
+				],
+			});
+
+			const libraries: SharePointLibrary[] = [];
+			const seen = new Set<string>();
+			for (const result of response.value ?? []) {
+				for (const container of result.hitsContainers ?? []) {
+					for (const hit of container.hits ?? []) {
+						const drive = hit.resource;
+						if (!drive?.id || seen.has(drive.id)) continue;
+						// Search for `drive` returns document libraries; skip anything
+						// that says otherwise (e.g. a personal OneDrive).
+						if (drive.driveType && drive.driveType !== 'documentLibrary') continue;
+						seen.add(drive.id);
+						libraries.push({
+							driveId: drive.id,
+							name: drive.name || drive.id,
+							webUrl: drive.webUrl,
+						});
+					}
+				}
+			}
+			return libraries;
+		} catch (error) {
+			logger.error('Failed to search SharePoint libraries:', error);
+			throw new OneDriveError(
+				`Failed to search SharePoint libraries: ${error instanceof Error ? error.message : 'Unknown error'}`
+			);
+		}
+	}
+
+	/**
+	 * Resolve a pasted SharePoint link (a folder's "Copy link", or the URL of
+	 * a library or folder) to the folder it points at.
+	 *
+	 * Uses GET /shares/{encoded-url}/driveItem, which works under
+	 * Files.ReadWrite (and so Files.ReadWrite.All).
+	 * https://learn.microsoft.com/graph/api/shares-get
+	 */
+	async resolveSharePointLink(url: string): Promise<SharePointFolderTarget> {
+		const trimmed = url.trim();
+		logger.debug('Resolving SharePoint link');
+
+		let item: OneDriveItem & { root?: unknown; webUrl?: string };
+		try {
+			item = await this.getGraph<OneDriveItem & { root?: unknown; webUrl?: string }>(
+				`/shares/${encodeSharingUrl(trimmed)}/driveItem`
+			);
+		} catch (error) {
+			logger.error('Failed to resolve SharePoint link:', error);
+			throw new OneDriveError(
+				`Could not open that link: ${error instanceof Error ? error.message : 'Unknown error'}`
+			);
+		}
+
+		const isDriveRoot = !!item.root;
+		if (!item.folder && !isDriveRoot) {
+			throw new OneDriveError('That link points to a file. Paste a link to a folder or a document library.');
+		}
+		const driveId = item.parentReference?.driveId;
+		if (!driveId) {
+			throw new OneDriveError('Could not tell which document library that link belongs to.');
+		}
+
+		// A library's root item is named "root"; show the library's own name.
+		let name = item.name;
+		if (isDriveRoot) {
+			name = (await this.getDriveName(driveId)) ?? name;
+		}
+		return { driveId, itemId: item.id, name, isDriveRoot, webUrl: item.webUrl };
+	}
+
+	/** Best-effort display name of a drive (a document library's title). */
+	private async getDriveName(driveId: string): Promise<string | undefined> {
+		try {
+			const drive = await this.getGraph<{ name?: string }>(`/drives/${driveId}?$select=name`);
+			return drive.name || undefined;
+		} catch (error) {
+			logger.warn('Could not read the document library name:', error);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Get the root folder of a drive (a SharePoint document library), whose
+	 * item id becomes the sync root when a whole library is chosen.
+	 */
+	async getDriveRoot(driveId: string): Promise<{ id: string; name: string }> {
+		try {
+			const root = await this.getGraph<OneDriveItem>(`/drives/${driveId}/root`);
+			return { id: root.id, name: root.name };
+		} catch (error) {
+			logger.error('Failed to get library root:', error);
+			throw new OneDriveError(
+				`Failed to open the document library: ${error instanceof Error ? error.message : 'Unknown error'}`
 			);
 		}
 	}
@@ -668,11 +838,17 @@ export class OneDriveClient {
 				const fullSub = relPrefix
 					? (cleanSubPath ? `${relPrefix}/${cleanSubPath}` : relPrefix)
 					: cleanSubPath;
+				// A whole SharePoint library is addressed through its drive root,
+				// the form Graph documents for delta (`/drives/{id}/root/delta`).
+				// Other shared folders keep their item-based form.
+				const base = this.remoteItemIsDriveRoot
+					? `/drives/${this.remoteDriveId}/root`
+					: `/drives/${this.remoteDriveId}/items/${this.remoteItemId}`;
 				if (fullSub) {
 					const encoded = encodePathForGraph(fullSub);
-					nextUrl = `/drives/${this.remoteDriveId}/items/${this.remoteItemId}:/${encoded}:/delta`;
+					nextUrl = `${base}:/${encoded}:/delta`;
 				} else {
-					nextUrl = `/drives/${this.remoteDriveId}/items/${this.remoteItemId}/delta`;
+					nextUrl = `${base}/delta`;
 				}
 			} else if (this.accessMode === OneDriveAccessMode.APP_FOLDER) {
 				// Scope the delta to the vault's subfolder within the app folder.

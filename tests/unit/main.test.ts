@@ -462,6 +462,76 @@ describe('OneDriveSyncPlugin', () => {
 		expect(plugin.settings.remoteRootPath).toBe('/SharedVault');
 	});
 
+	// A whole SharePoint library syncs from its drive root: delta paths come
+	// back as "/drives/{id}/root:/Folder", so the root on the drive is '' and
+	// must not be resolved (the root item is just named "root").
+	it('onRemoteFolderChanged stores a whole SharePoint library as a drive root', async () => {
+		mocks.tokenStorage.hasTokens.mockReturnValue(true);
+		await plugin.onload();
+
+		await plugin.onRemoteFolderChanged({
+			path: '/Team Notes/Vault',
+			name: 'Team Notes',
+			isShared: true,
+			driveId: 'library-drive',
+			itemId: 'library-root',
+			relativePathInShared: 'Vault',
+			isDriveRoot: true,
+			webUrl: 'https://contoso.sharepoint.com/sites/Team/Team%20Notes',
+		});
+
+		expect(mocks.oneDriveClient.resolveSharedFolderPath).not.toHaveBeenCalled();
+		expect(plugin.settings.remoteRootPath).toBe('');
+		expect(plugin.settings.remoteItemIsDriveRoot).toBe(true);
+		expect(plugin.settings.remoteWebUrl).toBe('https://contoso.sharepoint.com/sites/Team/Team%20Notes');
+		expect(plugin.settings.remoteRelativePathInShared).toBe('Vault');
+	});
+
+	it('onRemoteFolderChanged clears SharePoint fields when switching back to the own drive', async () => {
+		mocks.tokenStorage.hasTokens.mockReturnValue(true);
+		(plugin as any).loadData = vi.fn().mockResolvedValue({
+			remoteDriveId: 'library-drive',
+			remoteItemId: 'library-root',
+			remoteRootName: 'Team Notes',
+			remoteRootPath: '',
+			remoteItemIsDriveRoot: true,
+			remoteWebUrl: 'https://contoso.sharepoint.com/sites/Team/Team%20Notes',
+		});
+		await plugin.onload();
+
+		await plugin.onRemoteFolderChanged({ path: '/Notes', name: 'Notes', isShared: false });
+
+		expect(plugin.settings.remoteDriveId).toBeUndefined();
+		expect(plugin.settings.remoteItemIsDriveRoot).toBeUndefined();
+		expect(plugin.settings.remoteWebUrl).toBeUndefined();
+	});
+
+	it('onRemoteFolderChanged clears sync state when a different library has the same display path', async () => {
+		mocks.tokenStorage.hasTokens.mockReturnValue(true);
+		(plugin as any).loadData = vi.fn().mockResolvedValue({
+			remotePath: '/Documents',
+			remoteDriveId: 'library-drive',
+			remoteItemId: 'library-root-a',
+			remoteRootName: 'Documents',
+			remoteRootPath: '',
+			remoteItemIsDriveRoot: true,
+		});
+		await plugin.onload();
+		mocks.syncStateManager.clearState.mockClear();
+
+		// Same drive and path, different item: e.g. the vault folder was replaced
+		await plugin.onRemoteFolderChanged({
+			path: '/Documents',
+			name: 'Documents',
+			isShared: true,
+			driveId: 'library-drive',
+			itemId: 'library-root-b',
+			isDriveRoot: true,
+		});
+
+		expect(mocks.syncStateManager.clearState).toHaveBeenCalled();
+	});
+
 	it('onAppFolderSubpathChanged resets app settings and plugin sync options for a new subpath', async () => {
 		(plugin as any).loadData = vi.fn().mockResolvedValue({
 			accessMode: OneDriveAccessMode.APP_FOLDER,
@@ -697,7 +767,8 @@ describe('OneDriveSyncPlugin', () => {
 			'drive-id',
 			'item-id',
 			'SharedVault',
-			'Obsidian'
+			'Obsidian',
+			false
 		);
 	});
 
@@ -716,8 +787,55 @@ describe('OneDriveSyncPlugin', () => {
 			'drive-id',
 			'item-id',
 			'SharedVault',
-			'Obsidian'
+			'Obsidian',
+			false
 		);
+	});
+
+	it('onload configures a whole SharePoint library as a drive root', async () => {
+		mocks.tokenStorage.hasTokens.mockReturnValue(true);
+		(plugin as any).loadData = vi.fn().mockResolvedValue({
+			remoteDriveId: 'library-drive',
+			remoteItemId: 'library-root',
+			remoteRootName: 'Team Notes',
+			remotePath: '/Team Notes/Vault',
+			remoteRootPath: '',
+			remoteRelativePathInShared: 'Vault',
+			remoteItemIsDriveRoot: true,
+		});
+
+		await plugin.onload();
+
+		expect(mocks.oneDriveClient.setRemoteDrive).toHaveBeenCalledWith(
+			'library-drive',
+			'library-root',
+			'Team Notes',
+			'Vault',
+			true
+		);
+	});
+
+	// remoteRootPath '' (drive root) must not fall back to "/<library name>",
+	// or every delta path would be stripped against the wrong prefix.
+	it('SyncEngine strips delta paths against the drive root for a whole SharePoint library', async () => {
+		mocks.tokenStorage.hasTokens.mockReturnValue(true);
+		mocks.oneDriveClient.isSharedDrive.mockReturnValue(true);
+		(plugin as any).loadData = vi.fn().mockResolvedValue({
+			accessMode: OneDriveAccessMode.FULL_ACCESS,
+			remoteDriveId: 'library-drive',
+			remoteItemId: 'library-root',
+			remoteRootName: 'Team Notes',
+			remotePath: '/Team Notes/Vault',
+			remoteRootPath: '',
+			remoteRelativePathInShared: 'Vault',
+			remoteItemIsDriveRoot: true,
+		});
+
+		await plugin.onload();
+		await plugin.triggerManualSync();
+
+		const options = mocks.SyncEngine.mock.calls[0][7];
+		expect(options.remoteRootOnDrive).toBe('/Vault');
 	});
 
 	it('getRelativePathInShared returns an empty path for a moved shared-root shortcut', () => {

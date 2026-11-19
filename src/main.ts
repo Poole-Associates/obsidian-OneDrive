@@ -12,6 +12,8 @@ import {
 	ExperimentalSettings,
 	OneDriveAccessMode,
 	OneDriveItem,
+	SharePointFolderTarget,
+	SharePointLibrary,
 } from './types';
 import { DEFAULT_ONEDRIVE_CLIENT_ID, resolveOAuthEndpoints, resolveOAuthScopes } from './constants';
 import { logger, LogLevel } from './utils/logger';
@@ -365,7 +367,8 @@ export default class OneDriveSyncPlugin extends Plugin {
 					this.settings.remoteDriveId,
 					this.settings.remoteItemId,
 					this.settings.remoteRootName,
-					relativePathInShared
+					relativePathInShared,
+					this.settings.remoteItemIsDriveRoot === true
 				);
 			}
 
@@ -564,6 +567,8 @@ export default class OneDriveSyncPlugin extends Plugin {
 		this.settings.remoteRootName = undefined;
 		this.settings.remoteRootPath = undefined;
 		this.settings.remoteRelativePathInShared = undefined;
+		this.settings.remoteItemIsDriveRoot = undefined;
+		this.settings.remoteWebUrl = undefined;
 		this.syncStateManager.clearState();
 
 		this.authProvider = undefined;
@@ -700,6 +705,8 @@ export default class OneDriveSyncPlugin extends Plugin {
 		this.settings.remoteRootName = undefined;
 		this.settings.remoteRootPath = undefined;
 		this.settings.remoteRelativePathInShared = undefined;
+		this.settings.remoteItemIsDriveRoot = undefined;
+		this.settings.remoteWebUrl = undefined;
 
 		// Clear components
 		this.authProvider = undefined;
@@ -859,6 +866,38 @@ export default class OneDriveSyncPlugin extends Plugin {
 	}
 
 	/**
+	 * SharePoint libraries only exist for work and school accounts, so the
+	 * folder picker offers them only there.
+	 */
+	supportsSharePoint(): boolean {
+		return this.settings.accountType !== 'personal';
+	}
+
+	/** Find SharePoint document libraries by name, for the folder picker. */
+	async searchDocumentLibraries(query: string): Promise<SharePointLibrary[]> {
+		if (!this.oneDriveClient) {
+			throw new Error('Not connected to OneDrive');
+		}
+		return this.oneDriveClient.searchDocumentLibraries(query);
+	}
+
+	/** Resolve a pasted SharePoint folder or library link, for the folder picker. */
+	async resolveSharePointLink(url: string): Promise<SharePointFolderTarget> {
+		if (!this.oneDriveClient) {
+			throw new Error('Not connected to OneDrive');
+		}
+		return this.oneDriveClient.resolveSharePointLink(url);
+	}
+
+	/** Open a document library at its root, for the folder picker. */
+	async getLibraryRoot(driveId: string): Promise<{ id: string; name: string }> {
+		if (!this.oneDriveClient) {
+			throw new Error('Not connected to OneDrive');
+		}
+		return this.oneDriveClient.getDriveRoot(driveId);
+	}
+
+	/**
 	 * Compute the relative path from the shared root to the vault folder.
 	 * Prefer the value persisted from folder selection. For older settings
 	 * that predate that field, fall back to deriving it from the saved
@@ -891,7 +930,9 @@ export default class OneDriveSyncPlugin extends Plugin {
 	 *      → "/Documents/ObsidianVaults/JeffBrain"
 	 */
 	private getFullRemoteDrivePath(): string {
-		const basePath = this.settings.remoteRootPath || `/${this.settings.remoteRootName || ''}`;
+		// '' is a real value: a whole SharePoint library syncs from its drive
+		// root. Only an unset path (older settings) falls back to the name.
+		const basePath = this.settings.remoteRootPath ?? `/${this.settings.remoteRootName || ''}`;
 		const relative = this.getRelativePathInShared();
 		if (!relative) return basePath;
 		const cleanBase = basePath.replace(/\/+$/g, '');
@@ -907,6 +948,7 @@ export default class OneDriveSyncPlugin extends Plugin {
 
 		const oldPath = this.settings.remotePath;
 		const oldDriveId = this.settings.remoteDriveId;
+		const oldItemId = this.settings.remoteItemId;
 
 		this.settings.remotePath = selection.path;
 
@@ -915,9 +957,16 @@ export default class OneDriveSyncPlugin extends Plugin {
 			this.settings.remoteItemId = selection.itemId;
 			this.settings.remoteRootName = selection.name;
 			this.settings.remoteRelativePathInShared = selection.relativePathInShared?.replace(/^\/+|\/+$/g, '') || '';
+			this.settings.remoteItemIsDriveRoot = selection.isDriveRoot === true ? true : undefined;
+			this.settings.remoteWebUrl = selection.webUrl;
 
-			// Resolve the actual path on the remote drive for delta path stripping
-			if (this.oneDriveClient) {
+			if (selection.isDriveRoot) {
+				// A whole SharePoint library: delta paths come back relative to
+				// the drive root ("/drives/{id}/root:/Folder"), so the sync root
+				// on the drive is the root itself — an empty path, not "/<name>".
+				this.settings.remoteRootPath = '';
+			} else if (this.oneDriveClient) {
+				// Resolve the actual path on the remote drive for delta path stripping
 				try {
 					const resolvedPath = await this.oneDriveClient.resolveSharedFolderPath(
 						selection.driveId,
@@ -936,10 +985,18 @@ export default class OneDriveSyncPlugin extends Plugin {
 			this.settings.remoteRootName = undefined;
 			this.settings.remoteRootPath = undefined;
 			this.settings.remoteRelativePathInShared = undefined;
+			this.settings.remoteItemIsDriveRoot = undefined;
+			this.settings.remoteWebUrl = undefined;
 		}
 
 		// Clear stale sync state when the target folder changes
-		if (oldPath !== selection.path || oldDriveId !== this.settings.remoteDriveId) {
+		// (Compare the item too: two SharePoint libraries or folders can share a
+		// display path while being different places.)
+		if (
+			oldPath !== selection.path ||
+			oldDriveId !== this.settings.remoteDriveId ||
+			oldItemId !== this.settings.remoteItemId
+		) {
 			this.syncStateManager.clearState();
 			this.resetDeviceSpecificSyncSettings();
 			logger.info('Cleared sync state due to remote folder change');

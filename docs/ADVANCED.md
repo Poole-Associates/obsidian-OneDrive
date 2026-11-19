@@ -83,6 +83,24 @@ Then in Settings → OneDrive Sync:
 
 **Continuous Access Evaluation (CAE).** Business tenants can revoke a token mid-session in response to a risk signal (e.g. a password reset, or the user being disabled), via a mechanism this plugin does not implement support for. If you see an unexpected "please reconnect" prompt with no obvious cause, CAE is a likely explanation — simply reconnect.
 
+## SharePoint Document Libraries
+
+Work and school accounts can sync a vault with a folder in a **SharePoint document library** (for example a team site's "Documents"), not only with their own OneDrive. No extra permission is needed: the `Files.ReadWrite.All` permission from the app registration above already covers it.
+
+In Settings → OneDrive Sync → **Remote folder** → **Browse...**, the top of the folder picker has a **SharePoint** section with two ways in:
+
+- **Find a document library**: type a word from the library's name, such as the team or site name, then pick from the results. Each result shows the site it belongs to, so libraries that share a name ("Documents" exists on every site) can be told apart. Microsoft's search needs a word that appears in the library's name; it can't list every library.
+- **Open a SharePoint link**: paste a link to a folder or library. In SharePoint, use **Copy link** on the folder. A plain browser address of a library *view* (one ending in `AllItems.aspx`) may not open; copy the folder's link instead.
+
+Once a library or folder is open, browse into it and choose **Use this folder** as usual. Settings then shows the folder with "(SharePoint: *site*)" after it.
+
+### Limitations
+
+- **A vault in a folder inside a library is less proven than a vault at the library's root.** For a whole library the plugin tracks changes the way Microsoft documents for SharePoint (from the library's root). For a folder inside a library, and for a folder opened from a link, it tracks changes from that folder. Microsoft's documentation describes change tracking only from the root of a SharePoint drive, so if syncing a subfolder misbehaves, pick the whole library (or a library dedicated to the vault) instead, and please report it. The same applies to syncing Obsidian app settings, which tracks the vault's `.obsidian` folder.
+- **Libraries that require check-out** (Library settings → Versioning settings → *Require documents to be checked out before they can be edited*) are not supported: the plugin doesn't check files in or out, so uploads may stay checked out to you.
+- **Required metadata columns** and other library rules that block plain file uploads will make uploads fail.
+- **Personal Microsoft accounts** don't have SharePoint, so the section only appears for work and school accounts.
+
 ## Advanced Settings
 
 These settings are available under Settings → OneDrive Sync → Advanced:
