@@ -556,6 +556,56 @@ describe('OneDriveClient', () => {
 			expect(mockClient.api).toHaveBeenNthCalledWith(2, '/me/drive/special/approot/delta');
 		});
 
+		// OneDrive for Business / SharePoint: Graph answers an unusable token with
+		// HTTP 410 and a resyncChanges* code, and the message text doesn't
+		// necessarily name it.
+		it.each(['resyncChangesApplyDifferences', 'resyncChangesUploadDifferences'])(
+			'restarts the delta without the token on a 410 %s GraphError',
+			async (code) => {
+				const graphError = new Error('Resync required.') as unknown as Record<string, unknown>;
+				graphError.statusCode = 410;
+				graphError.code = code;
+				mockApiGet
+					.mockRejectedValueOnce(graphError)
+					.mockResolvedValueOnce({ value: [item1], '@odata.deltaLink': 'fresh-delta' });
+
+				await expect(client.getDelta('https://delta.example/token', 'vault_a')).resolves.toEqual({
+					items: [item1],
+					deltaLink: 'fresh-delta',
+				});
+				expect(mockClient.api).toHaveBeenNthCalledWith(1, 'https://delta.example/token');
+				// The fresh enumeration stays scoped to the vault, like a first sync.
+				expect(mockClient.api).toHaveBeenNthCalledWith(
+					2,
+					`/me/drive/special/approot:/${encodePathForGraph('vault_a')}:/delta`
+				);
+			}
+		);
+
+		it('restarts the delta on a bare HTTP 410 with no error code', async () => {
+			const graphError = new Error('Gone') as unknown as Record<string, unknown>;
+			graphError.statusCode = 410;
+			graphError.code = null;
+			mockApiGet
+				.mockRejectedValueOnce(graphError)
+				.mockResolvedValueOnce({ value: [item1], '@odata.deltaLink': 'fresh-delta' });
+
+			await expect(client.getDelta('https://delta.example/token')).resolves.toEqual({
+				items: [item1],
+				deltaLink: 'fresh-delta',
+			});
+		});
+
+		it('surfaces a 410 on a first sync (no token to drop) instead of looping', async () => {
+			const graphError = new Error('Gone') as unknown as Record<string, unknown>;
+			graphError.statusCode = 410;
+			graphError.code = 'resyncChangesApplyDifferences';
+			mockApiGet.mockRejectedValue(graphError);
+
+			await expect(client.getDelta()).rejects.toBeInstanceOf(OneDriveError);
+			expect(mockClient.api).toHaveBeenCalledTimes(1);
+		});
+
 		it('throws OneDriveError for other delta errors', async () => {
 			mockApiGet.mockRejectedValue(new Error('network down'));
 
