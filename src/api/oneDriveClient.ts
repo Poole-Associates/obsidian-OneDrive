@@ -731,11 +731,16 @@ export class OneDriveClient {
 				return { items: [], deltaLink: '' };
 			}
 
-			// If the delta token is invalid/expired, do a full resync
-			const msg = error instanceof Error ? error.message.toLowerCase() : '';
-			if (deltaLink &&
-				(msg.includes('resyncrequired') || msg.includes('resync required') || msg.includes('invalidtoken'))) {
-				logger.warn('Delta token expired, performing full resync');
+			// If the delta token is invalid/expired, do a full resync. Starting a
+			// fresh scoped enumeration is equivalent to following the 410's
+			// Location header (which Graph documents as "a new nextLink that
+			// starts a fresh delta enumeration from scratch") and keeps the
+			// request scoped to the vault exactly as a first sync would be.
+			// The engine treats the result like any token-less enumeration:
+			// upload-biased, as with "Reset sync token".
+			const resyncCode = deltaLink ? this.getDeltaResyncCode(error) : undefined;
+			if (resyncCode) {
+				logger.warn(`Delta token rejected (${resyncCode}), performing full resync`);
 				return this.getDelta(undefined, remotePath, subPath); // Retry without token
 			}
 
@@ -744,6 +749,31 @@ export class OneDriveClient {
 				`Failed to get delta: ${error instanceof Error ? error.message : 'Unknown error'}`
 			);
 		}
+	}
+
+	/**
+	 * Recognise an error that means "this delta token can't be used, start a
+	 * fresh enumeration", and return a short label for logging.
+	 *
+	 * Graph signals this with HTTP 410 Gone and an error code of
+	 * `resyncChangesApplyDifferences` or `resyncChangesUploadDifferences`
+	 * (https://learn.microsoft.com/graph/api/driveitem-delta). OneDrive for
+	 * Business and SharePoint return these; the older `resyncRequired` and
+	 * `invalidToken` codes are still matched for OneDrive Personal.
+	 */
+	private getDeltaResyncCode(error: unknown): string | undefined {
+		if (error && typeof error === 'object') {
+			const err = error as Record<string, unknown>;
+			const code = typeof err.code === 'string' ? err.code : '';
+			if (/^resync/i.test(code) || /^invalidtoken$/i.test(code)) return code;
+			if (err.statusCode === 410) return code || 'HTTP 410';
+		}
+		const msg = error instanceof Error ? error.message.toLowerCase() : '';
+		if (msg.includes('resyncrequired') || msg.includes('resync required') || msg.includes('invalidtoken')) {
+			return 'resyncRequired';
+		}
+		if (msg.includes('resyncchanges')) return 'resyncChanges';
+		return undefined;
 	}
 
 	private isItemNotFoundError(error: unknown): boolean {

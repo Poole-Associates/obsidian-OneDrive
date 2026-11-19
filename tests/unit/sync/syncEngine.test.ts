@@ -50,6 +50,7 @@ import { SyncEngine } from '../../../src/sync/syncEngine';
 import { SyncStateManager } from '../../../src/sync/syncState';
 import { ConflictResolver } from '../../../src/sync/conflictResolver';
 import { shouldSyncVaultPath } from '../../../src/utils/pathUtils';
+import { quickXorHash } from '../../../src/utils/contentHash';
 import {
 	ConflictResolutionStrategy,
 	LocalChangeType,
@@ -118,11 +119,30 @@ function hashContent(data: Uint8Array): string {
 	return hash.toString(16).padStart(8, '0');
 }
 
+/**
+ * Local bytes of a given size plus the remote `file` facet whose
+ * quickXorHash really matches them, for "same file on both sides" cases.
+ * Same-size files are verified by content hash, so a placeholder hash would
+ * read as a content mismatch.
+ */
+function matchingContent(size: number): {
+	buffer: () => ArrayBuffer;
+	file: NonNullable<OneDriveItem['file']>;
+} {
+	const bytes = Uint8Array.from({ length: size }, (_, i) => (i * 31 + 7) & 0xff);
+	return {
+		buffer: () => bytes.slice().buffer,
+		file: { mimeType: 'text/plain', hashes: { quickXorHash: quickXorHash(bytes) } },
+	};
+}
+
 // Tests stub the vault listing with mockReturnValue, and every non-first sync
 // scans it for external changes, so a stale listing would leak extra uploads
-// into whichever test runs next.
+// into whichever test runs next. Local file content is reset for the same
+// reason: same-size files are hashed, so stale content would change results.
 beforeEach(() => {
 	(mockApp.vault.getFiles as Mock).mockReset().mockReturnValue([]);
+	(mockApp.vault.adapter.readBinary as Mock).mockReset().mockResolvedValue(new ArrayBuffer(0));
 });
 
 describe('SyncEngine', () => {
@@ -973,13 +993,15 @@ describe('SyncEngine', () => {
 	});
 
 	it('skips downloading same-size files on first sync and stores state only', async () => {
+		const content = matchingContent(100);
 		mockClient.getDelta.mockResolvedValue({
-			items: [makeRemoteFile('notes/test.md', { id: 'remote-id', size: 100 })],
+			items: [makeRemoteFile('notes/test.md', { id: 'remote-id', size: 100, file: content.file })],
 			deltaLink: 'delta-link-2',
 		});
 		mockApp.vault.getAbstractFileByPath.mockReturnValue(
 			makeTFile('notes/test.md', 100, Date.now())
 		);
+		mockApp.vault.adapter.readBinary.mockImplementation(async () => content.buffer());
 
 		await syncEngine.performSync();
 
@@ -989,6 +1011,69 @@ describe('SyncEngine', () => {
 			oneDriveId: 'remote-id',
 			size: 100,
 		});
+	});
+
+	// OneDrive for Business and SharePoint generally return only quickXorHash,
+	// so a same-size edit must be caught by quickXorHash, not waved through.
+	it('downloads a same-size file on first sync when only quickXorHash is present and it differs', async () => {
+		const remote = matchingContent(100);
+		const local = new Uint8Array(remote.buffer());
+		local[42] ^= 0xff; // same size, different content
+		mockClient.getDelta.mockResolvedValue({
+			items: [makeRemoteFile('notes/test.md', { id: 'remote-id', size: 100, file: remote.file })],
+			deltaLink: 'delta-link-2',
+		});
+		mockApp.vault.getAbstractFileByPath.mockReturnValue(
+			makeTFile('notes/test.md', 100, Date.now())
+		);
+		mockApp.vault.adapter.readBinary.mockImplementation(async () => local.slice().buffer);
+
+		await syncEngine.performSync();
+
+		expect(mockFileOps.downloadFile).toHaveBeenCalledWith('remote-id');
+	});
+
+	it('prefers sha1Hash over quickXorHash when the remote carries both', async () => {
+		const content = new TextEncoder().encode('abc');
+		mockClient.getDelta.mockResolvedValue({
+			items: [
+				makeRemoteFile('notes/test.md', {
+					id: 'remote-id',
+					size: 3,
+					file: {
+						mimeType: 'text/plain',
+						// sha1 of "abc" matches; the quickXorHash is deliberately wrong.
+						hashes: {
+							sha1Hash: 'a9993e364706816aba3e25717850c26c9cd0d89d',
+							quickXorHash: 'not-the-real-hash',
+						},
+					},
+				}),
+			],
+			deltaLink: 'delta-link-2',
+		});
+		mockApp.vault.getAbstractFileByPath.mockReturnValue(makeTFile('notes/test.md', 3, Date.now()));
+		mockApp.vault.adapter.readBinary.mockImplementation(async () => content.slice().buffer);
+
+		await syncEngine.performSync();
+
+		expect(mockFileOps.downloadFile).not.toHaveBeenCalled();
+	});
+
+	it('falls back to the size match when the remote carries no hash', async () => {
+		mockClient.getDelta.mockResolvedValue({
+			items: [
+				makeRemoteFile('notes/test.md', { id: 'remote-id', size: 100, file: { mimeType: 'text/plain' } }),
+			],
+			deltaLink: 'delta-link-2',
+		});
+		mockApp.vault.getAbstractFileByPath.mockReturnValue(
+			makeTFile('notes/test.md', 100, Date.now())
+		);
+
+		await syncEngine.performSync();
+
+		expect(mockFileOps.downloadFile).not.toHaveBeenCalled();
 	});
 
 	it('downloads different-size files on first sync', async () => {
@@ -2271,8 +2356,10 @@ describe('SyncEngine first-sync local vault enumeration', () => {
 		(mockApp.vault.getAbstractFileByPath as Mock).mockImplementation(
 			(p: string) => localFiles.find((f) => f.path === p) ?? null
 		);
+		const content = matchingContent(100);
+		mockApp.vault.adapter.readBinary.mockImplementation(async () => content.buffer());
 		mockClient.getDelta.mockResolvedValue({
-			items: [makeRemoteFile('notes/keep.md', { id: 'remote-keep', size: 100 })],
+			items: [makeRemoteFile('notes/keep.md', { id: 'remote-keep', size: 100, file: content.file })],
 			deltaLink: 'first-delta',
 		});
 
@@ -2291,8 +2378,10 @@ describe('SyncEngine first-sync local vault enumeration', () => {
 		mockEventManager.getDirtyFiles.mockReturnValue([
 			{ path: 'notes/keep.md', type: LocalChangeType.CREATE },
 		]);
+		const content = matchingContent(100);
+		mockApp.vault.adapter.readBinary.mockImplementation(async () => content.buffer());
 		mockClient.getDelta.mockResolvedValue({
-			items: [makeRemoteFile('notes/keep.md', { id: 'remote-keep', size: 100 })],
+			items: [makeRemoteFile('notes/keep.md', { id: 'remote-keep', size: 100, file: content.file })],
 			deltaLink: 'first-delta',
 		});
 
@@ -2790,8 +2879,13 @@ describe('SyncEngine reconcile from cloud', () => {
 
 	it('deletes local-only files, downloads remote-only files, refreshes matching files', async () => {
 		// Cloud: A.md (matches local size), B.md (only in cloud), C.md (size mismatch)
+		// A.md's local bytes really match its remote hash (same-size files are hashed)
+		const contentA = matchingContent(10);
+		mockApp.vault.adapter.readBinary.mockImplementation(async (path: string) =>
+			path === 'A.md' ? contentA.buffer() : new ArrayBuffer(0)
+		);
 		mockClient.listAllItems.mockResolvedValue([
-			makeRemoteFile('A.md', { size: 10 }),
+			makeRemoteFile('A.md', { size: 10, file: contentA.file }),
 			makeRemoteFile('B.md', { size: 20 }),
 			makeRemoteFile('C.md', { size: 30 }),
 		]);
@@ -2920,8 +3014,13 @@ describe('SyncEngine reconcile to cloud', () => {
 
 	it('uploads local-only files, deletes remote-only files, refreshes matching files', async () => {
 		// Cloud: A.md (matches local size), B.md (only in cloud, should be deleted), C.md (size mismatch)
+		// A.md's local bytes really match its remote hash (same-size files are hashed)
+		const contentA = matchingContent(10);
+		mockApp.vault.adapter.readBinary.mockImplementation(async (path: string) =>
+			path === 'A.md' ? contentA.buffer() : new ArrayBuffer(0)
+		);
 		mockClient.listAllItems.mockResolvedValue([
-			makeRemoteFile('A.md', { size: 10 }),
+			makeRemoteFile('A.md', { size: 10, file: contentA.file }),
 			makeRemoteFile('B.md', { size: 20 }),
 			makeRemoteFile('C.md', { size: 30 }),
 		]);

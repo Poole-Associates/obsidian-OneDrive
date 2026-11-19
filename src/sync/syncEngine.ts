@@ -77,7 +77,7 @@ import {
 } from '../types';
 import { logger } from '../utils/logger';
 import { isDeferrableError } from '../utils/errors';
-import { sha1HexUpper } from '../utils/contentHash';
+import { quickXorHash, sha1HexUpper } from '../utils/contentHash';
 import {
 	normalizePath,
 	toOneDrivePath,
@@ -1579,24 +1579,36 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Verify a local file's content against the remote item's sha1Hash.
+	 * Verify a local file's content against the remote item's content hash.
+	 * Uses sha1Hash when the remote carries one (OneDrive Personal), and
+	 * otherwise quickXorHash — the only hash Microsoft guarantees on
+	 * OneDrive for Business and SharePoint, which generally omit sha1Hash.
 	 * Returns true/false when a comparison was possible, or undefined when
-	 * it wasn't (no remote hash, unreadable file, or no WebCrypto) so the
-	 * caller can fall back to the size heuristic.
+	 * it wasn't (no remote hash, unreadable file, or no WebCrypto for sha1)
+	 * so the caller can fall back to the size heuristic.
 	 */
 	private async localContentMatchesRemote(
 		path: string,
 		item: OneDriveItem
 	): Promise<boolean | undefined> {
 		const remoteSha1 = item.file?.hashes?.sha1Hash;
-		if (!remoteSha1) return undefined;
+		const remoteQuickXor = item.file?.hashes?.quickXorHash;
+		if (!remoteSha1 && !remoteQuickXor) return undefined;
 		try {
 			const content = await this.app.vault.adapter.readBinary(path);
-			const localSha1 = await sha1HexUpper(content);
-			if (!localSha1) return undefined;
-			const matches = localSha1 === remoteSha1.toUpperCase();
+			let matches: boolean;
+			let algorithm: string;
+			if (remoteSha1) {
+				const localSha1 = await sha1HexUpper(content);
+				if (!localSha1) return undefined;
+				matches = localSha1 === remoteSha1.toUpperCase();
+				algorithm = 'sha1';
+			} else {
+				matches = quickXorHash(content) === remoteQuickXor;
+				algorithm = 'quickXorHash';
+			}
 			if (!matches) {
-				logger.info(`Same-size content mismatch detected via sha1 for ${path}`);
+				logger.info(`Same-size content mismatch detected via ${algorithm} for ${path}`);
 			}
 			return matches;
 		} catch {
@@ -2759,7 +2771,7 @@ export class SyncEngine {
 					});
 				} else {
 					const remoteSize = item.size || 0;
-					// Same-size files are verified via sha1 when the remote item
+					// Same-size files are verified by content hash when the remote item
 					// carries a hash; without one we assume same content.
 					const contentMatches =
 						local.size === remoteSize
@@ -2979,7 +2991,7 @@ export class SyncEngine {
 					});
 				} else {
 					const remoteSize = item.size || 0;
-					// Same-size files are verified via sha1 when the remote item
+					// Same-size files are verified by content hash when the remote item
 					// carries a hash; without one we assume same content.
 					const contentMatches =
 						local.size === remoteSize
